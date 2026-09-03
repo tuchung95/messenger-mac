@@ -1,0 +1,7 @@
+# Sản phẩm build — dựng lại được từ nguồn, không commit
+build/
+release/
+
+# Rác của macOS và bản sao lưu tạm
+.DS_Store
+*.bak
