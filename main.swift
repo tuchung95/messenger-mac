@@ -14,6 +14,21 @@ let internalHosts = [
     "messenger.com", "facebook.com", "fbcdn.net", "fbsbx.com", "meta.com",
 ]
 
+/// How long the window stays closed before the page is recycled to give
+/// its accumulated caches back.
+let idleTrimDelay: TimeInterval = 10 * 60
+
+// Update feed. The release's .zip asset must contain Messenger.app.
+let updateFeedURL = URL(string:
+    "https://api.github.com/repos/tuchung95/messenger-mac/releases/latest")!
+let releasesPageURL = URL(string:
+    "https://github.com/tuchung95/messenger-mac/releases")!
+
+/// Quotes a path for /bin/sh; bundle paths can contain spaces.
+func shq(_ s: String) -> String {
+    return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
 func isInternal(_ url: URL?) -> Bool {
     guard let host = url?.host?.lowercased() else { return false }
     return internalHosts.contains { host == $0 || host.hasSuffix("." + $0) }
@@ -144,11 +159,23 @@ let themeSyncJS = #"""
 })();
 """#
 
+/// Answers whether a call or a playing clip would be cut short by a reload.
+let mediaActiveJS = #"""
+(function () {
+  var els = document.querySelectorAll("video, audio");
+  for (var i = 0; i < els.length; i++) {
+    if (!els[i].paused && !els[i].ended) { return true; }
+  }
+  return false;
+})();
+"""#
+
 // MARK: - App delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                          WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate,
-                         WKScriptMessageHandler, UNUserNotificationCenterDelegate {
+                         WKScriptMessageHandler, UNUserNotificationCenterDelegate,
+                         URLSessionDownloadDelegate {
 
     var window: NSWindow!
     var webView: WKWebView!
@@ -159,6 +186,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     private var useLegacy = false
     /// Suspends title-driven badge updates during a manual badge test.
     private var badgeTestUntil = Date.distantPast
+    /// Fires a page recycle once the window has been closed long enough.
+    private var idleTrimTimer: Timer?
+    /// A recycle replays the unread count from zero; the fallback banner would
+    /// otherwise announce every existing message again.
+    private var silentBadgeUntil = Date.distantPast
+    private var updatePanel: NSWindow?
+    private var updateBar: NSProgressIndicator?
+    private var updateLabel: NSTextField?
+    private var updateTask: URLSessionDownloadTask?
+    private var updateTag = ""
 
     func applicationDidFinishLaunching(_ note: Notification) {
         buildWebView()
@@ -199,6 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     }
 
     private func open(deepLink url: URL) {
+        cancelIdleTrim()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         webView.load(URLRequest(url: threadURL(from: url) ?? homeURL))
@@ -258,12 +296,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         // notification so a single message cannot fire two banners.
         let count = Int(badge) ?? 0
         defer { lastBadgeCount = count }
-        guard count > lastBadgeCount,
+        guard Date() >= silentBadgeUntil,
+              count > lastBadgeCount,
               Date().timeIntervalSince(lastWebNotification) > 5 else { return }
         let n = count - lastBadgeCount
         post(title: "Messenger",
              body: n == 1 ? "Bạn có tin nhắn mới" : "Bạn có \(n) tin nhắn mới",
              tag: "")
+    }
+
+    // MARK: Idle memory trim
+
+    /// Messenger keeps growing its image and DOM caches for as long as the page
+    /// lives, and closing the window only hides it. Once the window has been
+    /// closed for a while the page is recycled instead: a reload hands the
+    /// caches back but lets the page reconnect, so notifications keep arriving.
+    /// Unloading the view would free more, at the cost of silencing the app.
+    private func scheduleIdleTrim() {
+        idleTrimTimer?.invalidate()
+        idleTrimTimer = Timer.scheduledTimer(withTimeInterval: idleTrimDelay,
+                                             repeats: false) { [weak self] _ in
+            self?.trimMemory()
+        }
+    }
+
+    private func cancelIdleTrim() {
+        idleTrimTimer?.invalidate()
+        idleTrimTimer = nil
+    }
+
+    private func trimMemory() {
+        guard !window.isVisible else { return }
+        webView.evaluateJavaScript(mediaActiveJS) { [weak self] result, _ in
+            guard let self = self else { return }
+            // A call can outlive the window; wait it out rather than cut it off.
+            if (result as? Bool) == true { self.scheduleIdleTrim(); return }
+            let caches: Set<String> = [
+                WKWebsiteDataTypeDiskCache,
+                WKWebsiteDataTypeMemoryCache,
+                WKWebsiteDataTypeOfflineWebApplicationCache,
+            ]
+            self.silentBadgeUntil = Date().addingTimeInterval(30)
+            WKWebsiteDataStore.default().removeData(ofTypes: caches,
+                                                    modifiedSince: .distantPast) {
+                self.webView.reload()
+            }
+        }
     }
 
     // MARK: Notifications
@@ -364,6 +442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     func userNotificationCenter(_ center: UNUserNotificationCenter,
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler handler: @escaping () -> Void) {
+        cancelIdleTrim()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         handler()
@@ -406,10 +485,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // Closing the window parks the app in the Dock instead of quitting it.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         window.orderOut(nil)
+        scheduleIdleTrim()
         return false
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        cancelIdleTrim()
         if !flag { window.makeKeyAndOrderFront(nil) }
         return true
     }
@@ -503,6 +584,301 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         }
     }
 
+    // MARK: Update
+
+    private var currentVersion: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+            as? String) ?? "0"
+    }
+
+    private func alert(_ title: String, _ text: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = text
+        a.addButton(withTitle: "OK")
+        a.runModal()
+    }
+
+    /// Compares component by component: "1.10" is newer than "1.9", which a
+    /// plain string compare would get backwards.
+    private func isNewer(_ lhs: String, than rhs: String) -> Bool {
+        func parts(_ v: String) -> [Int] {
+            v.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
+                .split(separator: ".")
+                .map { Int($0.prefix(while: \.isNumber)) ?? 0 }
+        }
+        let l = parts(lhs), r = parts(rhs)
+        for i in 0..<max(l.count, r.count) {
+            let x = i < l.count ? l[i] : 0
+            let y = i < r.count ? r[i] : 0
+            if x != y { return x > y }
+        }
+        return false
+    }
+
+    @objc func checkForUpdate(_ sender: Any?) {
+        guard updateTask == nil else { updatePanel?.makeKeyAndOrderFront(nil); return }
+        var req = URLRequest(url: updateFeedURL)
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.timeoutInterval = 20
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let error = error {
+                    self.alert("Không kiểm tra được cập nhật", error.localizedDescription)
+                    return
+                }
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard code == 200, let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data)
+                        as? [String: Any],
+                      let tag = json["tag_name"] as? String
+                else {
+                    self.alert("Không kiểm tra được cập nhật", code == 404
+                        ? "Repo chưa có bản phát hành nào, hoặc đang ở chế độ riêng tư."
+                        : "GitHub trả về mã \(code).")
+                    return
+                }
+                guard self.isNewer(tag, than: self.currentVersion) else {
+                    self.alert("Đã là bản mới nhất",
+                               "Bạn đang dùng phiên bản \(self.currentVersion).")
+                    return
+                }
+                let assets = json["assets"] as? [[String: Any]] ?? []
+                let zip = assets.compactMap { $0["browser_download_url"] as? String }
+                    .first { $0.lowercased().hasSuffix(".zip") }
+                    .flatMap { URL(string: $0) }
+                guard let zip = zip else {
+                    self.alert("Bản \(tag) không có file cài",
+                               "Bản phát hành này không kèm file .zip nào.")
+                    NSWorkspace.shared.open(releasesPageURL)
+                    return
+                }
+                self.confirmUpdate(tag: tag, zip: zip,
+                                   notes: json["body"] as? String ?? "")
+            }
+        }.resume()
+    }
+
+    private func confirmUpdate(tag: String, zip: URL, notes: String) {
+        let a = NSAlert()
+        a.messageText = "Đã có bản \(tag)"
+        var text = "Bạn đang dùng \(currentVersion). Tải về và cài đặt ngay?"
+        let trimmed = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { text += "\n\n" + String(trimmed.prefix(400)) }
+        a.informativeText = text
+        a.addButton(withTitle: "Cập nhật")
+        a.addButton(withTitle: "Để sau")
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        updateTag = tag
+        showUpdatePanel("Đang tải bản \(tag)…")
+        let session = URLSession(configuration: .default, delegate: self,
+                                 delegateQueue: nil)
+        updateTask = session.downloadTask(with: zip)
+        updateTask?.resume()
+    }
+
+    private func showUpdatePanel(_ text: String) {
+        let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 380, height: 110),
+                             styleMask: [.titled], backing: .buffered, defer: false)
+        panel.title = "Cập nhật Messenger"
+        let label = NSTextField(labelWithString: text)
+        label.frame = NSRect(x: 20, y: 68, width: 340, height: 18)
+        let bar = NSProgressIndicator(frame: NSRect(x: 20, y: 44, width: 340, height: 16))
+        bar.style = .bar
+        bar.isIndeterminate = true
+        bar.minValue = 0
+        bar.maxValue = 1
+        bar.startAnimation(nil)
+        let cancel = NSButton(title: "Huỷ", target: self,
+                              action: #selector(cancelUpdate(_:)))
+        cancel.frame = NSRect(x: 280, y: 8, width: 80, height: 28)
+        cancel.bezelStyle = .rounded
+        panel.contentView?.addSubview(label)
+        panel.contentView?.addSubview(bar)
+        panel.contentView?.addSubview(cancel)
+        panel.center()
+        panel.makeKeyAndOrderFront(nil)
+        updatePanel = panel
+        updateBar = bar
+        updateLabel = label
+    }
+
+    private func closeUpdatePanel() {
+        updatePanel?.orderOut(nil)
+        updatePanel = nil
+        updateBar = nil
+        updateLabel = nil
+        updateTask = nil
+    }
+
+    @objc func cancelUpdate(_ sender: Any?) {
+        updateTask?.cancel()
+        closeUpdatePanel()
+    }
+
+    private func failUpdate(_ reason: String) {
+        closeUpdatePanel()
+        alert("Cập nhật thất bại", reason)
+    }
+
+    // MARK: Update — download delegate
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        guard totalBytesExpectedToWrite > 0 else { return }
+        let done = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+        DispatchQueue.main.async { [weak self] in
+            guard let bar = self?.updateBar else { return }
+            if bar.isIndeterminate {
+                bar.stopAnimation(nil)
+                bar.isIndeterminate = false
+            }
+            bar.doubleValue = done
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
+        guard let error = error, (error as NSError).code != NSURLErrorCancelled
+        else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.failUpdate(error.localizedDescription)
+        }
+    }
+
+    /// The temp file is gone once this returns, so the zip is moved out first.
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {
+        let stage = FileManager.default.temporaryDirectory
+            .appendingPathComponent("messenger-update-" + UUID().uuidString)
+        let zip = stage.appendingPathComponent("update.zip")
+        do {
+            try FileManager.default.createDirectory(at: stage,
+                                                    withIntermediateDirectories: true)
+            try FileManager.default.moveItem(at: location, to: zip)
+        } catch {
+            DispatchQueue.main.async { [weak self] in
+                self?.failUpdate(error.localizedDescription)
+            }
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.install(zip: zip, stage: stage)
+        }
+    }
+
+    // MARK: Update — install
+
+    /// Runs a tool and returns its combined output, or nil if it exited non-zero.
+    @discardableResult
+    private func run(_ tool: String, _ args: [String]) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: tool)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do { try p.run() } catch { return nil }
+        let out = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(),
+                         as: UTF8.self)
+        p.waitUntilExit()
+        return p.terminationStatus == 0 ? out : nil
+    }
+
+    /// codesign writes its description to stderr; `run` folds both streams.
+    private func signingAuthority(of app: URL) -> String? {
+        guard let out = run("/usr/bin/codesign", ["-dvv", app.path]) else { return nil }
+        return out.split(separator: "\n")
+            .first { $0.hasPrefix("Authority=") }
+            .map { String($0.dropFirst("Authority=".count)) }
+    }
+
+    private func install(zip: URL, stage: URL) {
+        updateLabel?.stringValue = "Đang kiểm tra bản tải về…"
+        updateBar?.isIndeterminate = true
+        updateBar?.startAnimation(nil)
+
+        func abort(_ why: String) {
+            try? FileManager.default.removeItem(at: stage)
+            failUpdate(why)
+        }
+
+        let unpacked = stage.appendingPathComponent("unpacked")
+        guard run("/usr/bin/ditto", ["-x", "-k", zip.path, unpacked.path]) != nil else {
+            abort("Không giải nén được file tải về."); return
+        }
+
+        // The app may sit at the top level or one folder down.
+        let fm = FileManager.default
+        var found: URL?
+        if let e = fm.enumerator(at: unpacked, includingPropertiesForKeys: nil) {
+            for case let url as URL in e where url.lastPathComponent == "Messenger.app" {
+                found = url; break
+            }
+        }
+        guard let newApp = found else {
+            abort("Không tìm thấy Messenger.app trong file tải về."); return
+        }
+
+        // Downloaded code replaces code that is already running, so require the
+        // signature to be intact and to come from the same signer as this build.
+        run("/usr/bin/xattr", ["-cr", newApp.path])
+        guard run("/usr/bin/codesign", ["--verify", "--deep", "--strict", newApp.path]) != nil
+        else {
+            abort("Chữ ký của bản tải về không hợp lệ."); return
+        }
+        let mine = signingAuthority(of: Bundle.main.bundleURL)
+        let theirs = signingAuthority(of: newApp)
+        guard mine == nil || mine == theirs else {
+            abort("Bản tải về được ký bởi \(theirs ?? "một bên khác"), "
+                  + "không khớp với \(mine!) của bản đang chạy."); return
+        }
+
+        let dest = Bundle.main.bundleURL
+        let helper = stage.appendingPathComponent("swap.sh")
+        // The bundle cannot overwrite itself while running, so a detached script
+        // waits for this process to exit, swaps it, and launches the new copy.
+        // The old bundle is kept aside until the copy succeeds.
+        let script = """
+        #!/bin/sh
+        DEST=\(shq(dest.path))
+        SRC=\(shq(newApp.path))
+        OLD="$DEST.old"
+        while kill -0 \(ProcessInfo.processInfo.processIdentifier) 2>/dev/null; do
+          sleep 0.2
+        done
+        sleep 0.5
+        rm -rf "$OLD"
+        mv "$DEST" "$OLD" 2>/dev/null
+        if cp -R "$SRC" "$DEST"; then
+          rm -rf "$OLD"
+          /usr/bin/xattr -cr "$DEST"
+        else
+          rm -rf "$DEST"
+          mv "$OLD" "$DEST"
+        fi
+        /usr/bin/open "$DEST"
+        rm -rf \(shq(stage.path))
+        """
+        do {
+            try script.write(to: helper, atomically: true, encoding: .utf8)
+        } catch {
+            abort(error.localizedDescription); return
+        }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = [helper.path]
+        do { try p.run() } catch {
+            abort("Không chạy được bước cài đặt."); return
+        }
+        updateLabel?.stringValue = "Đang cài bản \(updateTag), app sẽ mở lại…"
+        NSApp.terminate(nil)
+    }
+
     // MARK: Menu
 
     private func item(_ title: String, _ sel: Selector?, _ key: String,
@@ -518,6 +894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
         appMenu.addItem(item("Về Messenger", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), ""))
+        appMenu.addItem(item("Kiểm tra cập nhật…", #selector(checkForUpdate(_:)), ""))
         appMenu.addItem(.separator())
         appMenu.addItem(item("Gửi thông báo thử", #selector(testNotification(_:)), ""))
         let banners = item("Hiện thông báo banner", #selector(toggleBanners(_:)), "")
