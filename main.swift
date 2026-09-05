@@ -170,6 +170,28 @@ let mediaActiveJS = #"""
 })();
 """#
 
+/// messenger.com no longer puts the unread count in the document title, so it
+/// is read off the chat rail's own label — "Đoạn chat · 5 tin nhắn chưa đọc",
+/// "Chats · 5 unread messages". Thread rows carry their own smaller counts, so
+/// the largest label wins. -1 means the chat list is not up and the count is
+/// unknown, which is not the same as nothing unread.
+let unreadCountJS = #"""
+(function () {
+  if (!document.querySelector('[role="grid"]')) { return -1; }
+  var best = 0;
+  var els = document.querySelectorAll(
+    '[aria-label*="unread" i],[aria-label*="chưa đọc" i]');
+  for (var i = 0; i < els.length; i++) {
+    var m = (els[i].getAttribute("aria-label") || "").match(/\d+/);
+    if (m) { best = Math.max(best, parseInt(m[0], 10)); }
+  }
+  // Kept as a second source in case the label ever goes away again.
+  var t = document.title.match(/\((\d+)\)/);
+  if (t) { best = Math.max(best, parseInt(t[1], 10)); }
+  return best;
+})();
+"""#
+
 // MARK: - App delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
@@ -179,9 +201,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     var window: NSWindow!
     var webView: WKWebView!
-    private var titleObs: NSKeyValueObservation?
     private var lastWebNotification = Date.distantPast
     private var lastBadgeCount = 0
+    /// Unread messages as of the last reading, kept across reloads and
+    /// relaunches so the badge stays up while the page is not there to ask.
+    private var unreadCount = 0
+    /// The page reports the count only in its DOM, so it has to be asked.
+    private var badgeTimer: Timer?
     /// Set when UNUserNotificationCenter refuses this (non-Apple-signed) app.
     private var useLegacy = false
     /// Suspends title-driven badge updates during a manual badge test.
@@ -202,6 +228,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         buildWindow()
         buildMenu()
         setUpNotifications()
+        restoreBadge()
+        badgeTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) {
+            [weak self] _ in self?.syncBadge()
+        }
+        badgeTimer?.tolerance = 1
         if let pending = pendingURL {
             open(deepLink: pending)
             pendingURL = nil
@@ -275,34 +306,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = true
-
-        // messenger.com puts the unread count in the document title as "(3) Messenger".
-        titleObs = webView.observe(\.title, options: [.new]) { [weak self] _, _ in
-            self?.syncBadge()
-        }
     }
 
     private func syncBadge() {
         guard Date() >= badgeTestUntil else { return }
-        let title = webView.title ?? ""
-        var badge = ""
-        if title.hasPrefix("("), let close = title.firstIndex(of: ")") {
-            badge = String(title[title.index(after: title.startIndex)..<close])
-        }
-        NSApp.dockTile.badgeLabel = badge.isEmpty ? nil : badge
+        webView.evaluateJavaScript(unreadCountJS) { [weak self] result, _ in
+            guard let self = self else { return }
+            let count = (result as? NSNumber)?.intValue ?? -1
+            // The chat list is not up yet, so the count is unknown rather than
+            // zero: leave the badge that is already on the tile alone.
+            guard count >= 0 else { return }
+            self.showBadge(count)
 
-        // Fallback: if the page never called Notification but the unread count
-        // climbed, still tell the user. Suppressed right after a real web
-        // notification so a single message cannot fire two banners.
-        let count = Int(badge) ?? 0
-        defer { lastBadgeCount = count }
-        guard Date() >= silentBadgeUntil,
-              count > lastBadgeCount,
-              Date().timeIntervalSince(lastWebNotification) > 5 else { return }
-        let n = count - lastBadgeCount
-        post(title: "Messenger",
-             body: n == 1 ? "Bạn có tin nhắn mới" : "Bạn có \(n) tin nhắn mới",
-             tag: "")
+            // Fallback: if the page never called Notification but the unread
+            // count climbed, still tell the user. Suppressed right after a real
+            // web notification so a single message cannot fire two banners.
+            let previous = self.lastBadgeCount
+            self.lastBadgeCount = count
+            guard Date() >= self.silentBadgeUntil,
+                  count > previous,
+                  Date().timeIntervalSince(self.lastWebNotification) > 5 else { return }
+            let n = count - previous
+            self.post(title: "Messenger",
+                      body: n == 1 ? "Bạn có tin nhắn mới" : "Bạn có \(n) tin nhắn mới",
+                      tag: "")
+        }
+    }
+
+    private func showBadge(_ count: Int) {
+        unreadCount = count
+        UserDefaults.standard.set(count, forKey: "unreadCount")
+        NSApp.dockTile.badgeLabel = count > 0 ? String(count) : nil
+    }
+
+    /// Puts the count from the last session back on the tile so the badge is up
+    /// before the page has finished loading; it self-corrects once it has.
+    private func restoreBadge() {
+        showBadge(UserDefaults.standard.integer(forKey: "unreadCount"))
+        // Those messages were already counted, so they must not be announced.
+        lastBadgeCount = unreadCount
     }
 
     // MARK: Idle memory trim
@@ -357,6 +399,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         sender.state = bannersEnabled ? .on : .off
     }
 
+    /// User preference; the notification sound defaults to on.
+    private var soundEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "notificationSound") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "notificationSound") }
+    }
+
+    @objc func toggleSound(_ sender: NSMenuItem) {
+        soundEnabled.toggle()
+        sender.state = soundEnabled ? .on : .off
+    }
+
     /// NSLog is not retained for third-party apps, so diagnostics go to a file.
     private func diag(_ line: String) {
         let path = "/tmp/msgr-notify.log"
@@ -403,7 +456,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let content = UNMutableNotificationContent()
         content.title = title.isEmpty ? "Messenger" : title
         content.body = body
-        content.sound = .default
+        content.sound = soundEnabled ? .default : nil
         if !tag.isEmpty { content.threadIdentifier = tag }
         let req = UNNotificationRequest(identifier: UUID().uuidString,
                                         content: content, trigger: nil)
@@ -421,7 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let n = NSUserNotification()
         n.title = title.isEmpty ? "Messenger" : title
         n.informativeText = body
-        n.soundName = NSUserNotificationDefaultSoundName
+        n.soundName = soundEnabled ? NSUserNotificationDefaultSoundName : nil
         NSUserNotificationCenter.default.deliver(n)
         diag("legacy delivered: " + title + " / " + body)
     }
@@ -435,7 +488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                                 willPresent notification: UNNotification,
                                 withCompletionHandler handler:
                                     @escaping (UNNotificationPresentationOptions) -> Void) {
-        handler([.banner, .sound])
+        handler(soundEnabled ? [.banner, .sound] : [.banner])
     }
 
     // Clicking a banner brings the window back.
@@ -528,6 +581,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                  type: WKMediaCaptureType,
                  decisionHandler: @escaping (WKPermissionDecision) -> Void) {
         decisionHandler(isInternal(frame.request.url) ? .grant : .deny)
+    }
+
+    /// Every load replays the unread count from zero, so the fallback banner
+    /// has to sit out the moments after one or it announces the whole inbox.
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        silentBadgeUntil = Date().addingTimeInterval(20)
     }
 
     // MARK: Downloads
@@ -900,6 +959,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let banners = item("Hiện thông báo banner", #selector(toggleBanners(_:)), "")
         banners.state = bannersEnabled ? .on : .off
         appMenu.addItem(banners)
+        let sound = item("Phát âm thanh thông báo", #selector(toggleSound(_:)), "")
+        sound.state = soundEnabled ? .on : .off
+        appMenu.addItem(sound)
         appMenu.addItem(.separator())
         appMenu.addItem(item("Đăng xuất…", #selector(signOut(_:)), ""))
         appMenu.addItem(.separator())
