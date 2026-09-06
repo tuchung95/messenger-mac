@@ -173,22 +173,56 @@ let mediaActiveJS = #"""
 /// messenger.com no longer puts the unread count in the document title, so it
 /// is read off the chat rail's own label — "Đoạn chat · 5 tin nhắn chưa đọc",
 /// "Chats · 5 unread messages". Thread rows carry their own smaller counts, so
-/// the largest label wins. -1 means the chat list is not up and the count is
-/// unknown, which is not the same as nothing unread.
-let unreadCountJS = #"""
+/// the largest label wins.
+///
+/// The page reports the count instead of being asked for it: nothing runs while
+/// the DOM sits still, and a burst of mutations is read once, not once each.
+let unreadWatchJS = #"""
 (function () {
-  if (!document.querySelector('[role="grid"]')) { return -1; }
-  var best = 0;
-  var els = document.querySelectorAll(
-    '[aria-label*="unread" i],[aria-label*="chưa đọc" i]');
-  for (var i = 0; i < els.length; i++) {
-    var m = (els[i].getAttribute("aria-label") || "").match(/\d+/);
-    if (m) { best = Math.max(best, parseInt(m[0], 10)); }
+  if (window.__unreadWatch) { return; }
+  window.__unreadWatch = true;
+
+  var last = -1, pending = 0;
+
+  function read() {
+    // No chat list means the count is unknown, not zero.
+    if (!document.querySelector('[role="grid"]')) { return -1; }
+    var best = 0;
+    var els = document.querySelectorAll(
+      '[aria-label*="unread" i],[aria-label*="chưa đọc" i]');
+    for (var i = 0; i < els.length; i++) {
+      var m = (els[i].getAttribute("aria-label") || "").match(/\d+/);
+      if (m) { best = Math.max(best, parseInt(m[0], 10)); }
+    }
+    // Kept as a second source in case the label ever goes away again.
+    var t = document.title.match(/\((\d+)\)/);
+    if (t) { best = Math.max(best, parseInt(t[1], 10)); }
+    return best;
   }
-  // Kept as a second source in case the label ever goes away again.
-  var t = document.title.match(/\((\d+)\)/);
-  if (t) { best = Math.max(best, parseInt(t[1], 10)); }
-  return best;
+
+  function report() {
+    pending = 0;
+    var n = read();
+    if (n < 0 || n === last) { return; }
+    last = n;
+    try { window.webkit.messageHandlers.badge.postMessage(n); } catch (e) {}
+  }
+
+  // Messenger rewrites its DOM constantly; one read a second at the very most,
+  // and only after something actually moved.
+  function schedule() {
+    if (!pending) { pending = setTimeout(report, 1000); }
+  }
+
+  // Only aria-label edits are watched. Watching the tree itself would hand the
+  // engine a record for every node Messenger touches, which is most of them.
+  new MutationObserver(schedule).observe(document.documentElement, {
+    subtree: true, attributes: true, attributeFilter: ["aria-label"]
+  });
+  // Safety net for the count arriving on a node that was inserted with the
+  // label already on it, which is an edit no observer reports.
+  setInterval(report, 10000);
+  schedule();
 })();
 """#
 
@@ -206,8 +240,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     /// Unread messages as of the last reading, kept across reloads and
     /// relaunches so the badge stays up while the page is not there to ask.
     private var unreadCount = 0
-    /// The page reports the count only in its DOM, so it has to be asked.
-    private var badgeTimer: Timer?
     /// Set when UNUserNotificationCenter refuses this (non-Apple-signed) app.
     private var useLegacy = false
     /// Suspends title-driven badge updates during a manual badge test.
@@ -229,10 +261,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         buildMenu()
         setUpNotifications()
         restoreBadge()
-        badgeTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) {
-            [weak self] _ in self?.syncBadge()
-        }
-        badgeTimer?.tolerance = 1
         if let pending = pendingURL {
             open(deepLink: pending)
             pendingURL = nil
@@ -250,7 +278,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                 NSApp.dockTile.badgeLabel = "9"
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
-                self?.syncBadge()
+                guard let self = self else { return }
+                self.showBadge(self.unreadCount)
             }
         }
     }
@@ -293,12 +322,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         let ucc = WKUserContentController()
         ucc.add(self, name: "notify")
         ucc.add(self, name: "theme")
+        ucc.add(self, name: "badge")
         ucc.addUserScript(WKUserScript(source: themeSyncJS,
                                        injectionTime: .atDocumentEnd,
                                        forMainFrameOnly: true))
         ucc.addUserScript(WKUserScript(source: notifyShimJS,
                                        injectionTime: .atDocumentStart,
                                        forMainFrameOnly: false))
+        ucc.addUserScript(WKUserScript(source: unreadWatchJS,
+                                       injectionTime: .atDocumentEnd,
+                                       forMainFrameOnly: true))
         config.userContentController = ucc
 
         webView = WKWebView(frame: .zero, configuration: config)
@@ -308,34 +341,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         webView.allowsBackForwardNavigationGestures = true
     }
 
-    private func syncBadge() {
-        guard Date() >= badgeTestUntil else { return }
-        webView.evaluateJavaScript(unreadCountJS) { [weak self] result, _ in
-            guard let self = self else { return }
-            let count = (result as? NSNumber)?.intValue ?? -1
-            // The chat list is not up yet, so the count is unknown rather than
-            // zero: leave the badge that is already on the tile alone.
-            guard count >= 0 else { return }
-            self.showBadge(count)
+    private func applyUnread(_ count: Int) {
+        showBadge(count)
 
-            // Fallback: if the page never called Notification but the unread
-            // count climbed, still tell the user. Suppressed right after a real
-            // web notification so a single message cannot fire two banners.
-            let previous = self.lastBadgeCount
-            self.lastBadgeCount = count
-            guard Date() >= self.silentBadgeUntil,
-                  count > previous,
-                  Date().timeIntervalSince(self.lastWebNotification) > 5 else { return }
-            let n = count - previous
-            self.post(title: "Messenger",
-                      body: n == 1 ? "Bạn có tin nhắn mới" : "Bạn có \(n) tin nhắn mới",
-                      tag: "")
-        }
+        // Fallback: if the page never called Notification but the unread count
+        // climbed, still tell the user. Suppressed right after a real web
+        // notification so a single message cannot fire two banners.
+        let previous = lastBadgeCount
+        lastBadgeCount = count
+        guard Date() >= silentBadgeUntil,
+              count > previous,
+              Date().timeIntervalSince(lastWebNotification) > 5 else { return }
+        let n = count - previous
+        post(title: "Messenger",
+             body: n == 1 ? "Bạn có tin nhắn mới" : "Bạn có \(n) tin nhắn mới",
+             tag: "")
     }
 
     private func showBadge(_ count: Int) {
         unreadCount = count
         UserDefaults.standard.set(count, forKey: "unreadCount")
+        guard Date() >= badgeTestUntil else { return }
         NSApp.dockTile.badgeLabel = count > 0 ? String(count) : nil
     }
 
@@ -441,6 +467,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                                didReceive message: WKScriptMessage) {
         if message.name == "theme", let css = message.body as? String {
             applyTheme(cssColor: css)
+            return
+        }
+        if message.name == "badge", let count = message.body as? NSNumber {
+            applyUnread(count.intValue)
             return
         }
         guard message.name == "notify", let d = message.body as? [String: Any] else { return }
