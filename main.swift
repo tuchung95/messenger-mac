@@ -376,8 +376,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
     // MARK: Idle memory trim
 
     /// Messenger keeps growing its image and DOM caches for as long as the page
-    /// lives, and closing the window only hides it. Once the window has been
-    /// closed for a while the page is recycled instead: a reload hands the
+    /// lives, and closing the window only hides it. Once the window has been out
+    /// of sight for a while the page is recycled instead: a reload hands the
     /// caches back but lets the page reconnect, so notifications keep arriving.
     /// Unloading the view would free more, at the cost of silencing the app.
     private func scheduleIdleTrim() {
@@ -393,8 +393,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         idleTrimTimer = nil
     }
 
+    /// Out of sight covers both: closed, and open but wholly behind something.
+    private var windowIsSeen: Bool {
+        window.isVisible && window.occlusionState.contains(.visible)
+    }
+
     private func trimMemory() {
-        guard !window.isVisible else { return }
+        guard !windowIsSeen else { return }
         webView.evaluateJavaScript(mediaActiveJS) { [weak self] result, _ in
             guard let self = self else { return }
             // A call can outlive the window; wait it out rather than cut it off.
@@ -570,6 +575,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
         window.orderOut(nil)
         scheduleIdleTrim()
         return false
+    }
+
+    /// A window wholly behind other windows is no more use than a closed one,
+    /// so it starts the same countdown; coming back into view calls it off.
+    func windowDidChangeOcclusionState(_ note: Notification) {
+        if windowIsSeen { cancelIdleTrim() } else { scheduleIdleTrim() }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
